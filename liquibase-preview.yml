@@ -1,0 +1,54 @@
+# PR gate: read-only Liquibase preview against live env DBs.
+# Caller only — implementation lives in liquibase-preview-env.yml.
+#
+# PRs targeting main (and non-main workflow_dispatch) → dev + stage.
+# Ad-hoc prod preview: workflow_dispatch on main (release preview + sign-off lives on liquibase_update_prod.yml).
+# Does NOT run: update, update-testing-rollback, tag, clear-checksums, changelog-sync.
+name: Run Liquibase Preview
+
+on:
+  pull_request:
+    branches:
+      - main
+    paths:
+      - "schemas/**"
+      - ".github/workflows/liquibase-preview.yml"
+      - ".github/workflows/liquibase-preview-env.yml"
+  workflow_dispatch:
+
+concurrency:
+  group: liquibase-preview-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  preview-pr:
+    name: Preview (${{ matrix.github_environment }})
+    if: >
+      github.event_name == 'pull_request' ||
+      (github.event_name == 'workflow_dispatch' && github.ref != 'refs/heads/main')
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - github_environment: dev
+            lb_context: dev
+            runner_env: dev
+          - github_environment: stage
+            lb_context: stage
+            runner_env: stage
+    uses: ./.github/workflows/liquibase-preview-env.yml
+    with:
+      github_environment: ${{ matrix.github_environment }}
+      lb_context: ${{ matrix.lb_context }}
+      runner_env: ${{ matrix.runner_env }}
+    secrets: inherit
+
+  preview-prod:
+    name: Preview (prod)
+    if: github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main'
+    uses: ./.github/workflows/liquibase-preview-env.yml
+    with:
+      github_environment: prod
+      lb_context: prod
+      runner_env: prod
+    secrets: inherit

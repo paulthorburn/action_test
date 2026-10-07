@@ -1,0 +1,62 @@
+# Caller only — implementation lives in liquibase-update-env.yml.
+#
+# workflow_dispatch from main → prod preview, Environment approval, then selected schemas.
+# Dev/stage auto-deploys live in liquibase_update.yml (push to main).
+name: Run Liquibase Update (prod)
+
+on:
+  workflow_dispatch:
+    inputs:
+      platform:
+        description: Deploy platform schema to production
+        type: boolean
+        default: false
+      customer:
+        description: Deploy customer schema to production
+        type: boolean
+        default: false
+      franchise:
+        description: Deploy franchise schema to production
+        type: boolean
+        default: false
+      commercial:
+        description: Deploy commercial schema to production
+        type: boolean
+        default: false
+      note:
+        description: Optional note for this production run
+        type: string
+        required: false
+
+permissions: {}
+
+jobs:
+  require-main-for-prod:
+    name: Production dispatch must use main
+    if: github.ref != 'refs/heads/main'
+    permissions: {}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Refuse non-main production dispatch
+        run: |
+          echo "::error::Production deploys must be dispatched from the main branch (ref=${GITHUB_REF})."
+          exit 1
+
+  deploy-prod:
+    name: Deploy (prod)
+    if: github.ref == 'refs/heads/main'
+    permissions:
+      contents: write
+    uses: ./.github/workflows/liquibase-update-env.yml
+    with:
+      github_environment: prod
+      lb_context: prod
+      runner_env: prod
+      deploy_platform: ${{ inputs.platform }}
+      deploy_customer: ${{ inputs.customer }}
+      deploy_franchise: ${{ inputs.franchise }}
+      deploy_commercial: ${{ inputs.commercial }}
+      update_prod_tags: true
+      require_approval: true
+      preview_github_environment: prod-preview
+    secrets: inherit

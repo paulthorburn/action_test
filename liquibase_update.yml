@@ -1,0 +1,48 @@
+# Caller only — implementation lives in liquibase-update-env.yml.
+#
+# Push to main → deploy all schemas to dev, then stage.
+# Production is a separate workflow: liquibase_update_prod.yml.
+name: Run Liquibase Update
+
+on:
+  push:
+    branches:
+      - main
+
+permissions: {}
+
+jobs:
+  update-dev:
+    name: Update (dev)
+    permissions:
+      contents: read
+    uses: ./.github/workflows/liquibase-update-env.yml
+    with:
+      github_environment: dev
+      lb_context: dev
+      runner_env: dev
+      deploy_platform: true
+      deploy_customer: true
+      deploy_franchise: true
+      deploy_commercial: true
+      update_prod_tags: false
+      require_approval: false
+    secrets: inherit
+
+  update-stage:
+    name: Update (stage)
+    needs: update-dev
+    permissions:
+      contents: read
+    uses: ./.github/workflows/liquibase-update-env.yml
+    with:
+      github_environment: stage
+      lb_context: stage
+      runner_env: stage
+      deploy_platform: true
+      deploy_customer: true
+      deploy_franchise: true
+      deploy_commercial: true
+      update_prod_tags: false
+      require_approval: false
+    secrets: inherit

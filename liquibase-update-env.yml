@@ -1,0 +1,329 @@
+# Reusable Liquibase update (called by liquibase_update.yml and liquibase_update_prod.yml).
+# Do not trigger directly — no on.push / on.pull_request / on.workflow_dispatch here.
+#
+# When require_approval is true (prod dispatch):
+#   preview job uses GitHub Environment prod-preview (no required reviewers)
+#   update job uses github_environment (prod) and waits for Environment approval
+# Do not set environment: prod on the caller uses: job — that would gate preview too.
+name: Liquibase Update Env
+
+on:
+  workflow_call:
+    inputs:
+      github_environment:
+        description: GitHub Environment name (dev / stage / prod)
+        type: string
+        required: true
+      lb_context:
+        description: Liquibase context-filter
+        type: string
+        required: true
+      runner_env:
+        description: Self-hosted runner label (dev / stage / prod)
+        type: string
+        required: true
+      deploy_platform:
+        description: Deploy the platform schema
+        type: boolean
+        default: true
+      deploy_customer:
+        description: Deploy the customer schema
+        type: boolean
+        default: true
+      deploy_franchise:
+        description: Deploy the franchise schema
+        type: boolean
+        default: true
+      deploy_commercial:
+        description: Deploy the commercial schema
+        type: boolean
+        default: true
+      update_prod_tags:
+        description: After a successful update, force-move prod-<schema> tags to this SHA
+        type: boolean
+        default: false
+      require_approval:
+        description: Run a read-only preview first; gate update on Environment reviewers
+        type: boolean
+        default: false
+      preview_github_environment:
+        description: Unprotected Environment with prod DB credentials (preview only)
+        type: string
+        default: prod-preview
+
+concurrency:
+  group: liquibase-update-${{ inputs.github_environment }}
+  cancel-in-progress: false
+
+permissions: {}
+
+jobs:
+  preview:
+    name: Preview pending (${{ inputs.github_environment }})
+    if: ${{ inputs.require_approval }}
+    permissions:
+      contents: read
+    runs-on:
+      - self-hosted
+      - linux
+      - aws
+      - ${{ inputs.runner_env }}
+    environment: ${{ inputs.preview_github_environment }}
+    env:
+      LB_CONTEXT: ${{ inputs.lb_context }}
+      GITHUB_ENVIRONMENT: ${{ inputs.github_environment }}
+      SELECTED_SCHEMAS: ${{ format('{0} {1} {2} {3}', inputs.deploy_platform && 'platform' || '', inputs.deploy_customer && 'customer' || '', inputs.deploy_franchise && 'franchise' || '', inputs.deploy_commercial && 'commercial' || '') }}
+      LIQUIBASE_SHOW_BANNER: "false"
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Require at least one schema
+        run: |
+          set -euo pipefail
+          if [[ -z "${SELECTED_SCHEMAS// }" ]]; then
+            echo "::error::Select at least one schema to deploy"
+            exit 1
+          fi
+
+      - name: Preview pending changes (read-only)
+        env:
+          LB_URL: ${{ vars.LIQUIBASE_COMMAND_URL }}
+          LB_USER: ${{ vars.LIQUIBASE_COMMAND_USERNAME }}
+          LB_PASS: ${{ secrets.LIQUIBASE_COMMAND_PASSWORD }}
+        run: |
+          set -euo pipefail
+
+          fail=0
+
+          {
+            echo "# Liquibase pending — \`${GITHUB_ENVIRONMENT}\`"
+            echo ""
+            echo "Read-only. Context: \`${LB_CONTEXT}\`. SHA: \`${GITHUB_SHA}\`."
+            echo ""
+            echo "Review this summary, then **Approve** the waiting \`${GITHUB_ENVIRONMENT}\` Environment job to apply."
+            echo ""
+            echo "| Schema | validate | pending | unexpected |"
+            echo "| --- | --- | --- | --- |"
+          } >> "${GITHUB_STEP_SUMMARY}"
+
+          for schema in ${SELECTED_SCHEMAS}; do
+            echo "::group::${schema}"
+
+            validate_cell="OK"
+            pending_cell="—"
+            unexpected_cell="none"
+            status_out=""
+            unexpected_out=""
+
+            echo "→ validate"
+            set +e
+            validate_out="$(
+              cd "schemas/${schema}"
+              liquibase validate \
+                --changelog-file=changelog-root.xml \
+                --context-filter="${LB_CONTEXT}" \
+                --url="${LB_URL}" \
+                --username="${LB_USER}" \
+                --password="${LB_PASS}" 2>&1
+            )"
+            validate_rc=$?
+            set -e
+            if [ "${validate_rc}" -ne 0 ]; then
+              validate_cell="FAIL"
+              fail=1
+              echo "::error title=validate failed::${schema}"
+              echo "${validate_out}" | tail -n 40
+              echo "| \`${schema}\` | **FAIL** | — | — |" >> "${GITHUB_STEP_SUMMARY}"
+              {
+                echo ""
+                echo "## \`${schema}\` — validate failed"
+                echo ""
+                echo '```'
+                echo "${validate_out}" | tail -n 80
+                echo '```'
+              } >> "${GITHUB_STEP_SUMMARY}"
+              echo "::endgroup::"
+              continue
+            fi
+
+            echo "→ status --verbose"
+            set +e
+            status_out="$(
+              cd "schemas/${schema}"
+              liquibase status --verbose \
+                --changelog-file=changelog-root.xml \
+                --context-filter="${LB_CONTEXT}" \
+                --url="${LB_URL}" \
+                --username="${LB_USER}" \
+                --password="${LB_PASS}" 2>&1
+            )"
+            status_rc=$?
+            set -e
+            if [ "${status_rc}" -ne 0 ]; then
+              pending_cell="command FAIL"
+              fail=1
+              echo "::error title=status failed::${schema}"
+              echo "${status_out}" | tail -n 20
+            elif echo "${status_out}" | grep -q 'is up to date'; then
+              pending_cell="0 (up to date)"
+            elif pending_n="$(echo "${status_out}" | grep -oE '[0-9]+ changesets have not been applied' | grep -oE '^[0-9]+' | head -n1)" \
+              && [ -n "${pending_n}" ]; then
+              pending_cell="${pending_n} pending"
+              echo "::warning title=${schema} status::${pending_n} changeset(s) would run on update"
+            else
+              pending_cell="unknown (see summary)"
+              echo "::warning title=${schema} status::could not parse status output"
+            fi
+
+            echo "→ unexpected-changesets"
+            set +e
+            unexpected_out="$(
+              cd "schemas/${schema}"
+              liquibase unexpected-changesets --verbose \
+                --changelog-file=changelog-root.xml \
+                --context-filter="${LB_CONTEXT}" \
+                --url="${LB_URL}" \
+                --username="${LB_USER}" \
+                --password="${LB_PASS}" 2>&1
+            )"
+            unexpected_rc=$?
+            set -e
+            if [ "${unexpected_rc}" -ne 0 ]; then
+              unexpected_cell="command FAIL"
+              fail=1
+              echo "::error title=unexpected-changesets failed::${schema}"
+              echo "${unexpected_out}" | tail -n 20
+            elif echo "${unexpected_out}" | grep -q 'contains no unexpected changes'; then
+              unexpected_cell="0"
+            elif unexpected_n="$(echo "${unexpected_out}" | grep -oE '[0-9]+ unexpected changes were found' | grep -oE '^[0-9]+' | head -n1)" \
+              && [ -n "${unexpected_n}" ]; then
+              unexpected_cell="${unexpected_n}"
+              fail=1
+              echo "::error title=${schema} unexpected::${unexpected_n} changeset(s) in DB not in changelog"
+            else
+              unexpected_cell="unknown"
+              fail=1
+              echo "::error title=${schema} unexpected::could not parse unexpected-changesets output"
+            fi
+
+            echo "| \`${schema}\` | ${validate_cell} | ${pending_cell} | ${unexpected_cell} |" >> "${GITHUB_STEP_SUMMARY}"
+
+            {
+              echo ""
+              echo "<details>"
+              echo "<summary><code>${schema}</code> — status --verbose</summary>"
+              echo ""
+              echo '```'
+              echo "${status_out}"
+              echo '```'
+              echo ""
+              echo "</details>"
+              if [ "${unexpected_cell}" != "0" ] && [ "${unexpected_cell}" != "none" ]; then
+                echo ""
+                echo "<details>"
+                echo "<summary><code>${schema}</code> — unexpected-changesets</summary>"
+                echo ""
+                echo '```'
+                echo "${unexpected_out}"
+                echo '```'
+                echo ""
+                echo "</details>"
+              fi
+            } >> "${GITHUB_STEP_SUMMARY}"
+
+            echo "::endgroup::"
+          done
+
+          {
+            echo ""
+            echo "## Outcome"
+            echo ""
+            if [ "${fail}" -eq 0 ]; then
+              echo "Validate passed and no unexpected changesets. Approve the \`${GITHUB_ENVIRONMENT}\` deployment to apply."
+            else
+              echo "**Failed.** Fix validate / unexpected-changesets before this release can be approved."
+            fi
+          } >> "${GITHUB_STEP_SUMMARY}"
+
+          if [ "${fail}" -ne 0 ]; then
+            echo "::error::Liquibase preview failed — deploy will not be offered"
+            exit 1
+          fi
+
+  update:
+    name: Update schemas (${{ inputs.github_environment }})
+    needs: [preview]
+    if: ${{ always() && !cancelled() && (needs.preview.result == 'success' || needs.preview.result == 'skipped') }}
+    permissions:
+      contents: write
+    runs-on:
+      - self-hosted
+      - linux
+      - aws
+      - ${{ inputs.runner_env }}
+    environment: ${{ inputs.github_environment }}
+    env:
+      LB_CONTEXT: ${{ inputs.lb_context }}
+      SELECTED_SCHEMAS: ${{ format('{0} {1} {2} {3}', inputs.deploy_platform && 'platform' || '', inputs.deploy_customer && 'customer' || '', inputs.deploy_franchise && 'franchise' || '', inputs.deploy_commercial && 'commercial' || '') }}
+      LIQUIBASE_SHOW_BANNER: "false"
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: ${{ inputs.update_prod_tags }}
+
+      - name: Require at least one schema
+        run: |
+          set -euo pipefail
+          if [[ -z "${SELECTED_SCHEMAS// }" ]]; then
+            echo "::error::Select at least one schema to deploy"
+            exit 1
+          fi
+
+      - name: Update selected schemas
+        env:
+          LB_URL: ${{ vars.LIQUIBASE_COMMAND_URL }}
+          LB_USER: ${{ vars.LIQUIBASE_COMMAND_USERNAME }}
+          LB_PASS: ${{ secrets.LIQUIBASE_COMMAND_PASSWORD }}
+        run: |
+          set -euo pipefail
+
+          for schema in ${SELECTED_SCHEMAS}; do
+            echo "::group::${schema}"
+            cd "schemas/${schema}"
+            liquibase validate \
+              --changelog-file=changelog-root.xml \
+              --context-filter="${LB_CONTEXT}" \
+              --url="${LB_URL}" \
+              --username="${LB_USER}" \
+              --password="${LB_PASS}"
+            liquibase tag \
+              --tag="${GITHUB_SHA}" \
+              --url="${LB_URL}" \
+              --username="${LB_USER}" \
+              --password="${LB_PASS}"
+            liquibase update-testing-rollback \
+              --context-filter="${LB_CONTEXT}" \
+              --changelog-file=changelog-root.xml \
+              --url="${LB_URL}" \
+              --username="${LB_USER}" \
+              --password="${LB_PASS}"
+            cd - >/dev/null
+            echo "::endgroup::"
+          done
+
+      - name: Move production tags
+        if: ${{ inputs.update_prod_tags }}
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          for schema in ${SELECTED_SCHEMAS}; do
+            tag="prod-${schema}"
+            git tag -f "${tag}" "${GITHUB_SHA}"
+            git push -f origin "refs/tags/${tag}"
+            echo "::notice title=${tag}::Moved to ${GITHUB_SHA}"
+          done

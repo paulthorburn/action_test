@@ -1,0 +1,361 @@
+# Reusable env job for Run Liquibase Preview (called by liquibase-preview.yml).
+# Do not trigger directly — no `on.push` / `on.pull_request` here.
+name: Liquibase Preview Env
+
+on:
+  workflow_call:
+    inputs:
+      github_environment:
+        description: GitHub Environment name (dev / stage / prod)
+        type: string
+        required: true
+      lb_context:
+        description: Liquibase context-filter
+        type: string
+        required: true
+      runner_env:
+        description: Self-hosted runner label (dev / stage / prod)
+        type: string
+        required: true
+
+jobs:
+  preview:
+    name: Preview (${{ inputs.github_environment }})
+    runs-on:
+      - self-hosted
+      - linux
+      - aws
+      - ${{ inputs.runner_env }}
+    environment: ${{ inputs.github_environment }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7.0.1
+
+      - name: DB inventory (read-only)
+        env:
+          LB_URL: ${{ vars.LIQUIBASE_COMMAND_URL }}
+          LB_USER: ${{ vars.LIQUIBASE_COMMAND_USERNAME }}
+          LB_PASS: ${{ secrets.LIQUIBASE_COMMAND_PASSWORD }}
+          LIQUIBASE_SHOW_BANNER: "false"
+          GITHUB_ENVIRONMENT: ${{ inputs.github_environment }}
+        run: |
+          set -euo pipefail
+
+          if ! command -v psql >/dev/null 2>&1; then
+            echo "::warning title=DB inventory::psql not on PATH — skipping inventory"
+            exit 0
+          fi
+
+          # jdbc:postgresql://host:port/db  or  jdbc:postgresql://host/db
+          rest="${LB_URL#jdbc:postgresql://}"
+          hostport="${rest%%/*}"
+          db="${rest#*/}"
+          db="${db%%\?*}"
+          host="${hostport%%:*}"
+          port="${hostport##*:}"
+          if [ "${host}" = "${port}" ]; then
+            port="5432"
+          fi
+
+          run_sql() {
+            PGPASSWORD="${LB_PASS}" psql \
+              -h "${host}" -p "${port}" -U "${LB_USER}" -d "${db}" \
+              -X -A -t -q -v ON_ERROR_STOP=1 -F '|' -c "$1" 2>&1
+          }
+
+          {
+            echo "## Tracking inventory (read-only)"
+            echo ""
+            echo "Environment: \`${GITHUB_ENVIRONMENT}\`. SELECT-only — no Liquibase mutations."
+            echo ""
+            echo "| schema | changelog rows | distinct filenames | last applied | lock |"
+            echo "| --- | ---: | ---: | --- | --- |"
+          } >> "${GITHUB_STEP_SUMMARY}"
+
+          # Row counts per schema. High rows + unexpected-changesets usually means
+          # changelog files were renamed or deleted while history kept the old path.
+          for schema in platform customer franchise commercial payment; do
+            set +e
+            row="$(run_sql "SELECT count(*), count(DISTINCT filename), coalesce(max(dateexecuted)::text, 'n/a') FROM ${schema}.databasechangelog;")"
+            rc=$?
+            lock="$(run_sql "SELECT locked, coalesce(lockedby, '-') FROM ${schema}.databasechangeloglock WHERE id = 1;")"
+            lock_rc=$?
+            set -e
+
+            if [ "${rc}" -ne 0 ]; then
+              echo "::warning title=${schema} inventory::databasechangelog unreadable (rc=${rc})"
+              echo "| \`${schema}\` | n/a | n/a | n/a | n/a |" >> "${GITHUB_STEP_SUMMARY}"
+              continue
+            fi
+
+            rows="$(echo "${row}" | cut -d'|' -f1)"
+            files="$(echo "${row}" | cut -d'|' -f2)"
+            last="$(echo "${row}" | cut -d'|' -f3)"
+
+            lock_cell="n/a"
+            if [ "${lock_rc}" -eq 0 ]; then
+              locked="$(echo "${lock}" | cut -d'|' -f1)"
+              lockedby="$(echo "${lock}" | cut -d'|' -f2)"
+              if [ "${locked}" = "t" ]; then
+                lock_cell="LOCKED by ${lockedby}"
+                echo "::warning title=${schema} lock::changeloglock held by ${lockedby}"
+              else
+                lock_cell="free"
+              fi
+            fi
+
+            echo "${schema}: ${rows} changesets across ${files} file(s), last applied ${last}, lock ${lock_cell}"
+            echo "| \`${schema}\` | ${rows} | ${files} | ${last} | ${lock_cell} |" >> "${GITHUB_STEP_SUMMARY}"
+          done
+
+          echo "" >> "${GITHUB_STEP_SUMMARY}"
+
+          # Hot-path checksum freeze: stored md5sums for tip-drift / merge-conflict files.
+          # Compare Preview (dev) vs Preview (stage) job summaries when choosing
+          # <validCheckSum> vs clear-checksums after editing already-applied changesets.
+          {
+            echo "### Checksum freeze (hot paths)"
+            echo ""
+            echo "Stored \`md5sum\` values for reconcile decisions. SELECT-only."
+            echo "Use these when tip XML changes for an already-applied id (e.g. HALT vs MARK_RAN)."
+            echo ""
+            echo "| schema | filename | id | author | md5sum | dateexecuted |"
+            echo "| --- | --- | --- | --- | --- | --- |"
+          } >> "${GITHUB_STEP_SUMMARY}"
+
+          # filename patterns as Liquibase stores them in DATABASECHANGELOG
+          hot_filename_sql="filename IN ('changelog/1781833862-service-summary-engagements.xml','changelog/1783467178-add-property-protections.xml','changelog/1783452402-add-google-reviews.xml','changelog/init-schema.xml','changelog/000-init-schema.xml','changelog/1757186777-init-schema.xml','changelog/1768942647-init-platform-schema.xml')"
+
+          for schema in platform customer franchise commercial; do
+            set +e
+            freeze="$(
+              run_sql "SELECT filename, id, author, coalesce(md5sum, ''), coalesce(dateexecuted::text, '') FROM ${schema}.databasechangelog WHERE ${hot_filename_sql} ORDER BY filename, id;"
+            )"
+            freeze_rc=$?
+            set -e
+            if [ "${freeze_rc}" -ne 0 ] || [ -z "${freeze}" ]; then
+              continue
+            fi
+            while IFS='|' read -r fname cid author md5 when; do
+              [ -z "${fname}" ] && continue
+              echo "| \`${schema}\` | \`${fname}\` | \`${cid}\` | ${author} | \`${md5}\` | ${when} |" >> "${GITHUB_STEP_SUMMARY}"
+              echo "${schema} ${fname}::${cid}::${author} md5=${md5} at ${when}"
+            done <<< "${freeze}"
+          done
+
+          echo "" >> "${GITHUB_STEP_SUMMARY}"
+
+      - name: Preview changelogs vs live DB
+        env:
+          LB_CONTEXT: ${{ inputs.lb_context }}
+          LB_URL: ${{ vars.LIQUIBASE_COMMAND_URL }}
+          LB_USER: ${{ vars.LIQUIBASE_COMMAND_USERNAME }}
+          LB_PASS: ${{ secrets.LIQUIBASE_COMMAND_PASSWORD }}
+          LIQUIBASE_SHOW_BANNER: "false"
+          GITHUB_ENVIRONMENT: ${{ inputs.github_environment }}
+        run: |
+          set -euo pipefail
+
+          # Schemas to preview. payment: different infra / no runner yet.
+          schemas=(
+            platform
+            customer
+            franchise
+            commercial
+            # payment
+          )
+
+          fail=0
+
+          {
+            echo "# Liquibase preview — \`${GITHUB_ENVIRONMENT}\`"
+            echo ""
+            echo "Does **not** apply migrations. Context: \`${LB_CONTEXT}\`."
+            echo ""
+            echo "| Schema | validate | pending on update | unexpected |"
+            echo "| --- | --- | --- | --- |"
+          } >> "${GITHUB_STEP_SUMMARY}"
+
+          for schema in "${schemas[@]}"; do
+            echo "::group::${schema}"
+
+            validate_cell="OK"
+            pending_cell="—"
+            unexpected_cell="none"
+            status_out=""
+            unexpected_out=""
+
+            # --- validate ---
+            echo "→ validate"
+            set +e
+            validate_out="$(
+              cd "schemas/${schema}"
+              liquibase validate \
+                --changelog-file=changelog-root.xml \
+                --context-filter="${LB_CONTEXT}" \
+                --url="${LB_URL}" \
+                --username="${LB_USER}" \
+                --password="${LB_PASS}" 2>&1
+            )"
+            validate_rc=$?
+            set -e
+            if [ "${validate_rc}" -ne 0 ]; then
+              validate_cell="FAIL"
+              fail=1
+              echo "::error title=validate failed::${schema} — checksum or changelog error"
+              # Surface checksum mismatch lines prominently (for validCheckSum decisions).
+              checksum_lines="$(echo "${validate_out}" | grep -iE 'checksum|md5|Validation Failed|is different than' || true)"
+              if [ -n "${checksum_lines}" ]; then
+                echo "::error title=${schema} checksum mismatch::tip XML differs from DATABASECHANGELOG.md5sum — prefer validCheckSum over clear-checksums"
+                echo "${checksum_lines}" | head -n 40
+              fi
+              echo "${validate_out}" | tail -n 30
+              echo "| \`${schema}\` | **FAIL** | — | — |" >> "${GITHUB_STEP_SUMMARY}"
+              {
+                echo ""
+                echo "## \`${schema}\` — validate failed"
+                echo ""
+                if [ -n "${checksum_lines}" ]; then
+                  echo "### Checksum mismatch hints"
+                  echo ""
+                  echo "Stored hashes for this env are in **Checksum freeze** above. Copy the old \`md5sum\` into \`<validCheckSum>\` when intentionally editing an applied changeset; only use \`clear-checksums\` if the old hash is unknown."
+                  echo ""
+                  echo '```'
+                  echo "${checksum_lines}"
+                  echo '```'
+                  echo ""
+                fi
+                echo "<details>"
+                echo "<summary><code>${schema}</code> — validate (full tail)</summary>"
+                echo ""
+                echo '```'
+                echo "${validate_out}" | tail -n 80
+                echo '```'
+                echo ""
+                echo "</details>"
+              } >> "${GITHUB_STEP_SUMMARY}"
+              echo "::endgroup::"
+              continue
+            fi
+            echo "::notice title=${schema} validate::No validation errors"
+
+            # --- status (preview of update) ---
+            echo "→ status --verbose"
+            set +e
+            status_out="$(
+              cd "schemas/${schema}"
+              liquibase status --verbose \
+                --changelog-file=changelog-root.xml \
+                --context-filter="${LB_CONTEXT}" \
+                --url="${LB_URL}" \
+                --username="${LB_USER}" \
+                --password="${LB_PASS}" 2>&1
+            )"
+            status_rc=$?
+            set -e
+            if [ "${status_rc}" -ne 0 ]; then
+              pending_cell="command FAIL"
+              fail=1
+              echo "::error title=status failed::${schema} — liquibase status exited ${status_rc}"
+              echo "${status_out}" | tail -n 20
+            elif echo "${status_out}" | grep -q 'is up to date'; then
+              pending_cell="0 (up to date)"
+              echo "::notice title=${schema} status::up to date — update would apply nothing"
+            elif pending_n="$(echo "${status_out}" | grep -oE '[0-9]+ changesets have not been applied' | grep -oE '^[0-9]+' | head -n1)" \
+              && [ -n "${pending_n}" ]; then
+              pending_cell="${pending_n} pending"
+              echo "::warning title=${schema} status::${pending_n} changeset(s) would run on update"
+              echo "${status_out}" | grep -E 'changesets have not been applied|^[[:space:]]+changelog/' | head -n 15
+              if [ "${pending_n}" -gt 10 ]; then
+                echo "… truncated in logs; full list in job summary"
+              fi
+            else
+              pending_cell="unknown (see summary)"
+              echo "::warning title=${schema} status::could not parse status output"
+              echo "${status_out}" | tail -n 30
+            fi
+
+            # --- unexpected-changesets (findings fail the job; liquibase often exits 0) ---
+            echo "→ unexpected-changesets"
+            set +e
+            unexpected_out="$(
+              cd "schemas/${schema}"
+              liquibase unexpected-changesets --verbose \
+                --changelog-file=changelog-root.xml \
+                --context-filter="${LB_CONTEXT}" \
+                --url="${LB_URL}" \
+                --username="${LB_USER}" \
+                --password="${LB_PASS}" 2>&1
+            )"
+            unexpected_rc=$?
+            set -e
+            if [ "${unexpected_rc}" -ne 0 ]; then
+              unexpected_cell="command FAIL"
+              fail=1
+              echo "::error title=unexpected-changesets failed::${schema} — command exited ${unexpected_rc}"
+              echo "${unexpected_out}" | tail -n 20
+            elif echo "${unexpected_out}" | grep -q 'contains no unexpected changes'; then
+              unexpected_cell="0"
+              echo "::notice title=${schema} unexpected::none"
+            elif unexpected_n="$(echo "${unexpected_out}" | grep -oE '[0-9]+ unexpected changes were found' | grep -oE '^[0-9]+' | head -n1)" \
+              && [ -n "${unexpected_n}" ]; then
+              unexpected_cell="${unexpected_n}"
+              fail=1
+              echo "::error title=${schema} unexpected::${unexpected_n} changeset(s) in DB not in changelog"
+              echo "${unexpected_out}" | grep -E 'unexpected changes were found|::' | head -n 30
+              if [ "${unexpected_n}" -gt 30 ]; then
+                echo "… truncated in logs; full list in job summary"
+              fi
+            else
+              unexpected_cell="unknown"
+              fail=1
+              echo "::error title=${schema} unexpected::could not parse unexpected-changesets output"
+              echo "${unexpected_out}" | tail -n 30
+            fi
+
+            echo "| \`${schema}\` | ${validate_cell} | ${pending_cell} | ${unexpected_cell} |" >> "${GITHUB_STEP_SUMMARY}"
+
+            {
+              echo ""
+              echo "<details>"
+              echo "<summary><code>${schema}</code> — status --verbose (full)</summary>"
+              echo ""
+              echo '```'
+              echo "${status_out}"
+              echo '```'
+              echo ""
+              echo "</details>"
+              if [ "${unexpected_cell}" != "0" ] && [ "${unexpected_cell}" != "none" ]; then
+                echo ""
+                echo "<details>"
+                echo "<summary><code>${schema}</code> — unexpected-changesets (full)</summary>"
+                echo ""
+                echo '```'
+                echo "${unexpected_out}"
+                echo '```'
+                echo ""
+                echo "</details>"
+              fi
+            } >> "${GITHUB_STEP_SUMMARY}"
+
+            echo "::endgroup::"
+          done
+
+          {
+            echo ""
+            echo "## Outcome"
+            echo ""
+            if [ "${fail}" -eq 0 ]; then
+              echo "All checked schemas passed validate and had **no unexpected changesets**."
+            else
+              echo "**Failed.** See errors above (validate and/or unexpected-changesets)."
+              echo "Pending counts are informational; unexpected/validate failures block merge."
+            fi
+          } >> "${GITHUB_STEP_SUMMARY}"
+
+          if [ "${fail}" -ne 0 ]; then
+            echo "::error::Liquibase preview failed — see annotations and job summary"
+            exit 1
+          fi
+
+          echo "::notice::Liquibase preview OK for ${GITHUB_ENVIRONMENT}"
